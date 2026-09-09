@@ -1,454 +1,551 @@
-`# Fixed-capacity concurrent queues in C++
+# Fixed-capacity concurrent message queues in C++
 
-Status: proposed design, before implementation and concurrency validation.
+Status: design proposal; implementation and validation remain. Build **SPSC -> NCQ -> SPMC -> MPSC**.
 
-## 1. Objective and scope
+## 1. Scope and supported messages
 
-Build three fixed-capacity FIFO queues as an infrastructure interview project:
+Implement SPSC and NCQ-based SPMC/MPSC queues for general trivially copyable messages, including 500-byte structs, with fixed storage and drop-on-full behavior. Message storage is non-atomic and queue metadata is atomic. The direct atomic-payload MPSC/SPMC queues are not part of the implementation plan. SPSC overwrite using a seqlock-style protocol remains in [possible_extensions.md](possible_extensions.md).
 
-| Queue | Producers | Consumers | Example |
+```cpp
+struct Message {
+    std::byte bytes[500];
+};
+static_assert(std::is_trivially_copyable_v<Message>);
+```
+
+There is no small-message correctness restriction. Copying costs grow with `sizeof(T)`, which is fixed per queue instantiation. Variable-length messages can use a fixed maximum-size array plus a length field. `std::string` and `std::vector` are outside this value-copy interface.
+
+| Queue | Producers | Consumers | Delivery |
 | --- | --- | --- | --- |
-| SPSC | Exactly one | Exactly one | A feed handler passing events to a strategy thread |
-| MPSC | One or more | Exactly one | Several workers passing results to an aggregator |
-| SPMC | Exactly one | One or more | A dispatcher distributing work among workers |
+| SPSC | One | One | Each item goes to the sole consumer |
+| MPSC | Multiple | One | Producers merge into one FIFO |
+| SPMC | One | Multiple | Consumers compete; each item goes to one consumer |
 
-SPMC is a work queue: each accepted item goes to **one** consumer. It is not a broadcast buffer in which every consumer receives every item.
+SPMC here is a work queue, not broadcast. Every consumer receiving every message requires a different design.
 
 Requirements:
 
-- Compile-time capacity and an array allocated as part of the queue object.
-- No allocation, mutex, condition variable, or operating-system wait inside queue operations.
-- Reject the incoming item when full. Never overwrite an unread item.
-- Explicit atomic operations and documented memory ordering.
-- FIFO ordering, no duplicate delivery, and no loss of successfully accepted items.
-- Lock-free progress on supported targets, subject to the documented payload and counter constraints.
+- Compile-time capacity; all storage belongs to the queue object.
+- No allocation, mutex, condition variable, callback, or operating-system wait in push/pop.
+- Copy in on successful push; copy out on successful pop.
+- Reject incoming messages when storage is unavailable; never overwrite unread or actively accessed data.
+- Explain ownership, memory ordering, FIFO behavior, and progress separately.
+- Require lock-free metadata atomics on the target.
 
-Start with C++20. Exclude resizing, blocking wrappers, overwriting, batching, iterators, references into slots, and concurrent destruction from version 1.
+Exclude resizing, blocking wrappers, overwrite mode, zero-copy references, concurrent reset/destruction, and exact concurrent size queries.
 
-## 2. The important design choice
+## 2. Selected design and research basis
 
-**Using atomics does not, by itself, make a queue lock-free.**
+SPSC retains the direct array with separate read/write counters.
 
-- **Wait-free:** each operation finishes in a bounded number of its own steps.
-- **Lock-free:** some operation makes progress despite other threads being suspended; an individual caller may starve.
-- **Mutex-free:** no mutex is used, but a suspended thread may still prevent useful progress.
+MPSC/SPMC use **a fixed message array and two bounded index queues**. Indices refer to internal storage; callers still push/pop complete T values and do not manage a pool.
 
-A common bounded queue reserves a position, writes a non-atomic payload, and then publishes a per-slot sequence number. That is attractive for general C++ objects, but a producer suspended between reservation and publication can leave a hole at the front. The original description of a widely used sequence-number queue explicitly disclaims formal lock-freedom. [Vyukov's bounded queue](https://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue)
+The research basis is Ruslan Nikolaev's *A Scalable, Portable, and Memory-Efficient Lock-Free FIFO Queue* (DISC 2019). Section 3 describes two-queue indirection for arbitrary-size data. Section 4 presents NCQ (Naive Circular Queue); Section 6 gives its lock-free argument. Choose NCQ initially because its CAS/helping protocol is smaller to study than SCQ's FAA, invalidation, and threshold protocol. SCQ is a later performance option, not a prerequisite for large messages. The source assumes a bounded participant count no greater than pool capacity. [Paper](https://arxiv.org/html/1908.04511)
 
-This project therefore uses:
+Use the author's [NCQ reference implementation, lfring_naive.h](https://github.com/rusnikola/lfqueue/blob/master/lfring_naive.h). The [repository](https://github.com/rusnikola/lfqueue) distinguishes NCQ from SCQ and provides both.
 
-| Queue | Selected baseline | Payload | Progress |
-| --- | --- | --- | --- |
-| SPSC | Separate producer and consumer cursors | Small trivially copyable value | Bounded queue-level steps |
-| MPSC | Atomically publish payload and generation together; help the producer cursor | Compact integer value/token | Lock-free CAS loop |
-| SPMC | Atomically consume payload and reclaim its slot together; help the consumer cursor | Compact integer value/token | Lock-free CAS loop |
+This is an adaptation of an existing algorithm. A published argument supports that algorithm; it does not automatically validate our C++ port. Pin the reference commit when implementation begins, retain applicable attribution/license notices if porting code, and review deviations explicitly.
 
-The MPSC/SPMC algorithms below are a proposed, deliberately restricted design, not a claim to have reproduced a published, production-validated algorithm. Their proof sketches must be checked against the implementation and adversarial schedules.
+| Component | Initial implementation |
+| --- | --- |
+| SPSC | Direct message array, acquire/release cursors |
+| MPSC | Message pool + free-index NCQ + ready-index NCQ |
+| SPMC | Same pool/NCQ engine, restricted public thread topology |
+| Internal NCQ | Full MPMC implementation initially; no topology-specific weakening |
 
-**Tradeoff:** a compact atomic record is simpler to reason about than helping with arbitrary C++ object construction, but limits payload size and needs an explicit generation-exhaustion policy. Do not present it as an unrestricted `Queue<T>`.
+MPSC/SPMC use three shared fixed arrays: message blocks and the two index rings. The message array is storage, not a per-producer queue. Blocks have no permanent producer assignment.
 
-If unrestricted payloads and indefinite operation are required, treat that as a separate design milestone. SCQ is a published bounded, lock-free FIFO design worth studying; its cancellation and generation protocol should be adopted with its proof, rather than approximated by adding a CAS to the simpler reservation scheme. [Nikolaev's paper](https://arxiv.org/abs/1908.04511), [author's implementation](https://github.com/rusnikola/lfqueue)
+NCQ supports MPMC operations internally. Expose and test SPMC and MPSC message queues first; advertising a general MPMC wrapper would additionally require simultaneous multi-producer/multi-consumer validation. A published algorithm and benchmarks do not replace tests of this port.
 
-## 3. Public API and semantics
+## 3. API and precise capacity contract
 
-Illustrative API; not an implementation:
+Illustrative API:
 
 ```cpp
-enum class PushResult { success, full, exhausted };
+enum class PushResult { success, no_capacity };
 enum class PopResult  { success, empty };
 
-template <std::size_t Capacity>
+template <class T, std::size_t Capacity>
 class MpscRing {
 public:
-    using value_type = std::uint32_t;
-
-    [[nodiscard]] PushResult try_push(value_type value) noexcept;
-    [[nodiscard]] PopResult try_pop(value_type& out) noexcept;
+    using value_type = T;
+    [[nodiscard]] PushResult try_push(const T& value) noexcept;
+    [[nodiscard]] PopResult try_pop(T& out) noexcept;
     static constexpr std::size_t capacity() noexcept { return Capacity; }
 
     MpscRing();
     MpscRing(const MpscRing&) = delete;
     MpscRing& operator=(const MpscRing&) = delete;
+    MpscRing(MpscRing&&) = delete;
+    MpscRing& operator=(MpscRing&&) = delete;
 };
 ```
 
-Use the same operational interface for the other topologies. SPSC does not need the compact-record exhaustion policy described below and never returns `exhausted`.
+Use the same operational interface for SPSC and SPMC.
 
-| Operation | Contract |
+| Result | Meaning |
 | --- | --- |
-| Successful `try_push` | Queue accepts a copy of the value exactly once |
-| `full` | Attempt does not enqueue anything; caller retains its value |
-| `exhausted` | Compact-record generation budget is exhausted; no enqueue occurs |
-| Successful `try_pop` | Removes exactly one item and writes it to `out` |
-| `empty` | Removes nothing and leaves `out` unchanged |
-| `capacity()` | Returns the number of usable slots, exactly `Capacity` |
+| Push success | A copy of the message has been published |
+| Push no_capacity | Nothing accepted; input unchanged |
+| Pop success | Exactly one message removed and copied into out |
+| Pop empty | Nothing removed; out unchanged |
 
-“Drop on full” means the **caller may discard a rejected incoming value**. The queue reports rejection; it must not silently pretend to accept it. Callers may count drops, retry, or apply another policy outside the queue.
+### Capacity includes messages being copied
 
-For the sequentially consistent MPSC/SPMC baseline, full and empty decisions must correspond to a valid point during the call. For acquire/release SPSC, allow conservative failure when the other cursor's latest advancement has not been observed. A failed attempt is not a promise that the queue remains full or empty after return.
-
-`try_` means there is no wait for capacity or data. It does **not** promise bounded execution time for a contended CAS loop.
-
-No exact concurrent `size()`, `empty()`, or `full()` observer in version 1: two cursor reads need not form a consistent snapshot, and helped cursors can lag completed slot transitions. Use the operation result directly. Any later `size_approx()` is diagnostic only.
-
-The queue must be initialized before publication to workers. Destruction, reset, and thread-role reassignment require external synchronization and no outstanding operations. The object is neither copyable nor movable. No consumer fairness guarantee is made.
-
-## 4. Storage and target assumptions
-
-- `N = Capacity` is a power of two, with `N >= 2`.
-- Slot index is `position & (N - 1)`.
-- Logical positions distinguish different visits to the same physical slot.
-- All `N` slots are usable; no sentinel slot is sacrificed.
-- Queue operations do not allocate, log, invoke callbacks, or manipulate reference-counted objects.
-- Require `std::atomic<std::uint64_t>::is_always_lock_free` on the supported build. Fail clearly if this is false; a hidden library lock violates the project contract.
-- Record the compiler, architecture, build flags, and atomic lock-free checks in benchmark results. Larger `std::atomic<struct>` values are not automatically lock-free. [C++ atomic lock-free properties](https://eel.is/c++draft/atomics.lockfree)
-
-Start with `uint32_t` values for all queues to make comparisons meaningful. An integer token may identify an external object, but that object's ownership, lifetime, and allocation are outside this queue's guarantee.
-
-Place independently written cursors on separate, configurable cache-line boundaries. Start with compact slots; benchmark per-slot padding before adding it. Padding every slot can increase the working set substantially.
-
-## 5. SPSC design
-
-### State
+For MPSC/SPMC, Capacity = N is the number of message blocks. At abstract ownership boundaries:
 
 ```text
-slots[N]                 // ordinary, non-atomic values
-atomic<uint64_t> write   // producer's next publication position
-atomic<uint64_t> read    // consumer's next consumption position
+free blocks + producer-owned blocks + ready blocks + consumer-owned blocks = N
 ```
 
-Initially both cursors are zero. Only the producer writes `write`; only the consumer writes `read`.
+A push returns `no_capacity` when it cannot obtain a free block. A block held by an in-flight copy still consumes capacity. Filling an empty queue with sequential pushes and no pops accepts exactly N messages and rejects the next.
 
-### Enqueue
+For example, a consumer may have removed an index but still be copying its message. That block cannot yet be reused. A push may therefore fail while fewer than N published messages remain in the ready queue. **Rejection is not proof that N published messages exist.** This is a resource-bounded API, not an exact occupancy-only full predicate.
+
+Drop-on-full means the caller may discard a rejected incoming value. The queue reports rejection and never silently loses accepted messages. A failed attempt says nothing about capacity becoming available immediately afterward.
+
+There is no wait for new data or capacity, but internal CAS retries are allowed. `try_` does not imply bounded own-step completion under contention.
+
+For SPSC, an acquire load may conservatively observe an older opposite cursor and reject an attempt. For the initial sequentially consistent NCQ engine, failure follows the corresponding internal dequeue's empty decision. The wrapper has no separate size/full check.
+
+### Message and object lifetime
+
+- Require a complete, non-cv, trivially copyable object type T. Wrap raw arrays in a struct or `std::array` for the public type.
+- Arguments are live complete T objects; out is writable. Callers must not access those objects concurrently in a conflicting way.
+- Copy representations with `std::memcpy` and `std::addressof`; do not invoke custom assignment operations.
+- Internal blocks are byte arrays of sizeof(T). The queue does not require T's default constructor or copy-assignment operator.
+- Never cast internal bytes to T*. Copy the saved representation into the caller's existing T object.
+- Pointer members are copied as pointers. Pointee lifetime remains the application's responsibility.
+
+Byte copying for trivially copyable objects is supported by the [C++ object-representation rules](https://eel.is/c++draft/basic.types.trivial).
+
+Initialize before publishing the queue to threads. Reset, destruction, and thread-role reassignment require external synchronization and no outstanding calls. Never reclaim a suspended thread's block if it might resume.
+
+## 4. Fixed storage and target assumptions
 
 ```text
-w = write.load(relaxed)
-r = read.load(acquire)
-if unsigned_distance(w, r) == N:
-    return full
+N = Capacity, a power of two
 
-slots[w & mask] = value
-write.store(w + 1, release)
-return success
+SPSC:
+    byte_blocks[N][sizeof(T)]
+    atomic<uint64_t> read, write
+
+MPSC/SPMC:
+    byte_blocks[N][sizeof(T)]
+    NcqIndexRing<N> free_indices
+    NcqIndexRing<N> ready_indices
+
+Each NcqIndexRing:
+    atomic<uint64_t> entries[N]  // generation plus internal block index
+    atomic<uint64_t> head, tail
 ```
 
-### Dequeue
+All N message blocks are usable. Approximate MPSC/SPMC storage before padding is `N * sizeof(T) + 2 * N * 8` bytes plus cursors. There is no atomic 500-byte object or external allocator.
+
+Require `std::atomic<uint64_t>::is_always_lock_free`. Reject unsupported builds rather than silently using library locks. [C++ atomic lock-free properties](https://eel.is/c++draft/atomics.lockfree)
+
+Separate independently written cursors onto configurable cache-line boundaries. Start without per-message padding. Reference-code cache-index remapping is a later optimization; it must be applied consistently to access and initialization.
+
+Document maximum participant count K. Initially require N >= K for MPSC/SPMC and at most one outstanding call per participant. K includes the sole endpoint and every participant on the multi-threaded side. Use N >= 2 for SPSC.
+
+## 5. SPSC: direct array with ownership transfers
+
+Initially read = write = 0. Only the producer writes write; only the consumer writes read.
 
 ```text
-r = read.load(relaxed)
-w = write.load(acquire)
-if r == w:
-    return empty
+try_push(value):
+    w = write.load(relaxed)
+    r = read.load(acquire)
+    if unsigned_distance(w, r) == N:
+        return no_capacity
+    copy sizeof(T) bytes from value into blocks[w & (N - 1)]
+    write.store(w + 1, release)
+    return success
 
-out = slots[r & mask]
-read.store(r + 1, release)
-return success
+try_pop(out):
+    r = read.load(relaxed)
+    w = write.load(acquire)
+    if r == w:
+        return empty
+    copy sizeof(T) bytes from blocks[r & (N - 1)] into out
+    read.store(r + 1, release)
+    return success
 ```
 
-### Why this works
+Empty is read == write; full is unsigned write - read == N.
 
-The producer writes a slot before publishing `write`. A consumer that acquires that publication can safely read the ordinary payload. The consumer finishes its read before releasing `read`; a producer that acquires that advancement can safely reuse the slot.
+The producer completes its entire copy before releasing write. The consumer acquires publication before reading, finishes its copy, and releases read. The producer acquires reclamation before overwriting that block.
+
+## 6. Shared MPSC/SPMC ownership protocol
+
+Initialize free_indices with every index 0..N-1 exactly once and ready_indices empty.
 
 ```text
-payload write
-    -> write.store(release)
-    -> write.load(acquire), observing publication
-    -> payload read
-    -> read.store(release)
-    -> read.load(acquire), observing reclamation
-    -> next payload write into that slot
+FREE
+  -> producer acquires index
+PRODUCER-OWNED
+  -> producer finishes copy and publishes index
+READY
+  -> consumer removes index
+CONSUMER-OWNED
+  -> consumer finishes copy and returns index
+FREE
 ```
 
-These two ownership transfers prevent both reading an unfinished item and overwriting an item still being read. Each cursor has one writer, so no CAS is needed. The successful enqueue takes effect at the write-cursor store; successful dequeue takes effect at the read-cursor store.
-
-Release/acquire synchronization depends on observing the appropriate publication, not merely putting those labels on unrelated accesses. [C++ memory-order specification](https://eel.is/c++draft/atomics.order)
-
-With bounded value copies and bounded atomic primitives, each call has bounded work and no retry loop. Say “wait-free at the algorithm level”; C++ lock-free atomic availability alone is not a universal hardware latency guarantee.
-
-Use unsigned modular arithmetic for the cursors, keep capacity below half the counter range, and preserve the occupancy invariant `0 <= distance(write, read) <= N`. There is no delayed CAS observer in SPSC; the other endpoint cannot lap a paused endpoint indefinitely. Physical index wrap and unsigned counter wrap should both be tested.
-
-## 6. Compact atomic records for MPSC and SPMC
-
-### Representation
-
-Use a single `atomic<uint64_t>` per slot:
+These are proof states, not an additional per-block atomic state machine.
 
 ```text
-upper 32 bits: generation/state sequence
-lower 32 bits: payload value
+try_push(value):
+    i = free_indices.try_dequeue()
+    if no index:
+        return no_capacity
+    copy sizeof(T) bytes from value into blocks[i]
+    ready_indices.enqueue_assuming_space(i)
+    return success
+
+try_pop(out):
+    i = ready_indices.try_dequeue()
+    if no index:
+        return empty
+    copy sizeof(T) bytes from blocks[i] into out
+    free_indices.enqueue_assuming_space(i)
+    return success
 ```
 
-Pack and unpack with unsigned shifts and masks. Do not use implementation-dependent C++ bit-field layout. All 32-bit payload values are legal; no value is reserved to mean empty.
+Acquiring a storage block does not reserve a position in the message FIFO. The ready index is published only after the copy is complete.
 
-For logical position `p`:
+Do not access blocks[i] before successfully dequeuing its index. Losing consumers must never speculatively copy ordinary message bytes.
+
+### Why internal enqueue has space
+
+Every index is in one queue or owned by one operation. A caller publishing/returning an index owns a block currently absent from the destination queue. Across all callers, there are only N indices. Consequently, the destination can accommodate the enqueue without waiting for a future dequeue.
+
+This conservation invariant is a precondition of NCQ enqueue. Keep `enqueue_assuming_space` private; it cannot accept arbitrary or duplicate indices. Contention may cause retries, but it does not poll for capacity.
+
+There is no cancellation/failure path after taking a block: the copy cannot invoke throwing user code, and the index must be published or returned exactly once.
+
+## 7. NCQ index engine
+
+The pseudocode below adapts the author's [NCQ implementation](https://github.com/rusnikola/lfqueue/blob/master/lfring_naive.h). It uses identity slot mapping, seq_cst operations, strong CAS, and fresh loads on each retry. The reference retains some local observations across retries and uses weaker memory orders; those optimizations are deferred.
+
+### Representation and initialization
+
+For N = 2^b, an atomic entry uses its low b bits for a block index and the remaining bits for the cycle. Message size consumes no generation bits.
 
 ```text
-EMPTY(p) = sequence 2*p
-READY(p, value) = sequence 2*p + 1 plus payload
+physical slot = position & (N - 1)
+cycle base   = position & ~(N - 1)   // uint64_t arithmetic
+entry        = cycle base | block_index
 ```
 
-Initialize slot `i` to `EMPTY(i)`. After consuming position `p`, the slot becomes `EMPTY(p + N)`.
+The physical index-ring slot and the stored message-block index are different concepts.
+
+With identity mapping, an empty ring starts with head = tail = N and entries at cycle zero. A full free ring starts with head = 0, tail = N, and entries containing the distinct block indices at cycle zero.
+
+### Enqueue behavior
+
+Read tail and its entry. If the entry is already published for tail's cycle, help advance tail. Otherwise, an immediately preceding-cycle entry is eligible under the capacity precondition. Publish current cycle plus block index with a CAS on the complete entry, then attempt tail advancement.
+
+Refresh stale observations on other generation mismatches or conflicting updates. Do not increment tail to create a private reservation before publication. Publication linearizes at the successful entry CAS.
+
+### Dequeue behavior
+
+Read head and atomically copy its entry. A matching cycle supplies a candidate index. CAS head forward to claim that candidate; only the winner returns it. On failure discard the candidate and retry. An immediately preceding-cycle entry indicates empty; other mismatches require refreshing state.
+
+Dequeue does not clear the entry. Its candidate was copied atomically before claiming head, so later entry replacement cannot tear that local copy. Message bytes are accessed only after ownership is obtained.
+
+### Implementation pseudocode
+
+All positions, entries, and masks below are uint64_t. N is a power of two, N >= 2. The counter-lifetime precondition below applies; this pseudocode does not establish safety through full counter wrap.
 
 ```text
-EMPTY(p) -- publish payload atomically --> READY(p, value)
-READY(p, value) -- consume atomically --> EMPTY(p + N)
+class NcqIndexRing<N>:
+    MASK = uint64_t(N - 1)
+    CYCLE_MASK = bitwise_not_64(MASK)
+
+    atomic<uint64_t> entries[N]
+    atomic<uint64_t> head
+    atomic<uint64_t> tail
+
+    cycle(x):
+        return x & CYCLE_MASK
+
+    slot(position):
+        return position & MASK
+
+    block_index(entry):
+        return entry & MASK
 ```
 
-There is no publicly visible “reserved but not yet published” slot state. Consumers take a local copy of the complete atomic record before attempting to consume it. There are no concurrent ordinary accesses to the slot payload.
+In this pseudocode, `CAS(atom, old, next)` creates a local `expected = old` and calls `compare_exchange_strong(expected, next, seq_cst, seq_cst)`. It returns only success/failure; it does not modify the caller's `old`. Thus a failed CAS cannot silently change the logical position used by later expressions. Every shared load is seq_cst too.
+
+**Initialization:** perform before threads can access the object, not as concurrent reset operations.
+
+```text
+init_empty():                       // For ready_indices
+    for i in 0 .. N-1:
+        entries[i].initialize(0)    // Cycle zero; low bits are not a live index
+    head.initialize(N)              // First dequeue expects cycle N
+    tail.initialize(N)              // First publication uses cycle N
+
+init_full():                        // For free_indices
+    for i in 0 .. N-1:
+        entries[i].initialize(i)    // Cycle zero, distinct live block index i
+    head.initialize(0)
+    tail.initialize(N)
+```
+
+`initialize` denotes construction or initialization before publication, not a special concurrent atomic operation. The initial zero in an empty entry is not an empty-value sentinel: block index zero is valid. The entry's cycle relative to head distinguishes absence from a live index.
+
+**Enqueue:** private operation; caller owns a valid index and the two-queue conservation invariant guarantees capacity for this insertion.
+
+```text
+enqueue_assuming_space(index):
+    assert 0 <= index < N
+
+    loop:
+        t = tail.load(seq_cst)
+        j = slot(t)
+        observed = entries[j].load(seq_cst)
+        tc = cycle(t)
+        ec = cycle(observed)
+
+        if ec == tc:
+            // Someone published t but may not have advanced tail yet.
+            CAS(tail, t, t + 1)
+            continue
+
+        if ec + N != tc:
+            // Snapshot belongs to a different lap. Refresh both observations.
+            continue
+
+        // Entry from the preceding cycle is eligible under our capacity invariant.
+        desired = tc | index
+        if CAS(entries[j], observed, desired):
+            // Publication has succeeded, regardless of who advances tail.
+            CAS(tail, t, t + 1)
+            return
+
+        // Another publisher changed the entry. Restart with fresh observations.
+```
+
+This function has no `full` result. It must not be called arbitrarily on an already full ring. The message wrapper detects no_capacity by failing to dequeue a free index before copying a message. Internal enqueue is safe only with the ownership accounting described in section 6.
+
+**Dequeue:** returns an optional index, not a payload. All values 0..N-1 are valid indices, so represent absence separately.
+
+```text
+try_dequeue() -> optional<uint64_t>:
+    loop:
+        h = head.load(seq_cst)
+        j = slot(h)
+        observed = entries[j].load(seq_cst)
+        hc = cycle(h)
+        ec = cycle(observed)
+
+        if ec != hc:
+            if ec + N == hc:
+                return none          // Next position is not published.
+            continue                 // Stale snapshot; reload head and entry.
+
+        candidate = block_index(observed)
+        if CAS(head, h, h + 1):
+            return some(candidate)   // This caller exclusively owns that index.
+
+        // Another consumer claimed the position. Discard candidate and retry.
+```
+
+Do not clear entries[j] after the successful head CAS. A producer may already have reused that physical entry. The returned index is a local copy from the atomic load, and the caller now owns its separate message block.
+
+**Small example, N = 4:** an empty ring starts at head = tail = 4 with cycle-zero entries. Publishing block index 2 into position 4 changes entries[0] to `4 | 2 = 6`; tail advances to 5. Dequeue sees cycle(6) = cycle(4) = 4, claims head 4 -> 5, and returns `6 & 3 = 2`. It leaves entries[0] unchanged. At position 8, that entry's cycle 4 is the preceding cycle and can be replaced under the capacity invariant.
+
+### NCQ pseudocode attribution
+
+Adapted from lfring_naive.h, Copyright (c) 2019 Ruslan Nikolaev. The source is dual-licensed under BSD-2-Clause/MIT; the MIT notice for this adaptation is retained here:
+
+```text
+Copyright (c) 2019 Ruslan Nikolaev
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
 
 ### Memory ordering
 
-Use **`memory_order_seq_cst` for every shared load, store, and CAS in the initial MPSC/SPMC implementation**, including CAS failure ordering. Use `compare_exchange_strong` to make the progress argument independent of spurious failures. Every retry reloads the cursor and record.
+Initially use **seq_cst for every shared NCQ metadata load and CAS, including CAS failure order**, and strong CAS. The reference uses acquire loads and acquire/release CAS in many places; retain stronger ordering in the first port until reviewed.
 
-This conservative baseline makes the proof use one total order of shared atomic operations. Do not copy SPSC's relaxed cursor operations into these algorithms. Here, helpers and atomic slot transitions interact with cursor advancement. Weakening these orders needs a separate argument, especially if payload tokens publish access to external memory.
-
-`seq_cst` is a correctness baseline, not a claim that it fixes flawed ownership protocols.
-
-### Counter exhaustion and ABA
-
-Do **not** let the compact sequence field silently wrap. A thread suspended with an old CAS expectation could otherwise succeed against a different generation of the same slot: the ABA problem.
-
-For a 32-bit sequence field, define:
-
-```text
-L = 2^31 - N
-valid enqueue positions: 0 <= p < L
-```
-
-At position `L`, enqueues return `exhausted`; existing items can still drain. The final reclamation sequence fits in 32 bits. Cursors use `uint64_t` and never wrap within this lifetime. Require `N < 2^31`.
-
-Only after all operations have stopped and the queue is drained may the owner reinitialize it. This is an externally coordinated lifecycle operation, not a concurrent hot-path reset.
-
-This limitation is material: roughly two billion publications is only about 3.6 minutes at ten million enqueues per second. A 16-bit payload / 48-bit sequence configuration extends the budget to roughly `2^47` publications, about 163 days at that rate, but still requires an exhaustion policy. These are operation-budget illustrations, not performance predictions.
-
-For an interview prototype, the 32/32 layout is easy to inspect and exhaustion is easy to test. For a long-running infrastructure queue, resolving this limitation is a prerequisite: use a validated wrap-safe algorithm, or a wider record only on a target where its atomic operations are actually lock-free.
-
-## 7. MPSC design
-
-### State and ownership
-
-```text
-atomic<uint64_t> slots[N]
-atomic<uint64_t> tail_hint = 0   // producers advance/help this cursor
-uint64_t consumer_pos = 0       // private to the only consumer
-```
-
-The cursor is a hint to the earliest publication position not yet acknowledged by producers. A successful slot CAS publishes an item; cursor advancement can be helped afterward.
-
-### Producer algorithm
-
-All shared operations below are sequentially consistent.
-
-```text
-loop:
-    p = tail_hint.load()
-    if p == L:
-        return exhausted
-
-    record = slots[p & mask].load()
-    s = sequence(record)
-
-    if s < 2*p:
-        return full
-
-    if s > 2*p:
-        tail_hint.CAS(p, p + 1)    // another producer already published p
-        continue
-
-    if slots[p & mask].CAS(record, READY(p, value)):
-        tail_hint.CAS(p, p + 1)    // one attempt; somebody else may have helped
-        return success
-
-    // CAS lost to another producer; restart with fresh state
-```
-
-CAS the **entire record**, including its observed payload bits. The old payload is irrelevant logically but still part of the atomic expected value.
-
-### Consumer algorithm
-
-```text
-p = consumer_pos
-record = slots[p & mask].load()
-if sequence(record) != 2*p + 1:
-    return empty
-
-value = payload(record)
-slots[p & mask].store(EMPTY(p + N))
-consumer_pos = p + 1
-out = value
-return success
-```
-
-No consumer CAS is needed: there is only one consumer, and producers cannot modify a ready slot. The consumer can pop a published record before its producer has advanced `tail_hint`.
-
-### Why this works
-
-1. **Exclusive publication:** only one producer can change a particular `EMPTY(p)` record to `READY(p, value)`.
-2. **No publication hole:** the payload and readiness appear in the same atomic transition. A producer paused before its CAS owns nothing.
-3. **Helping:** a record sequence greater than `2*p` proves position `p` was already published, possibly consumed too. Any producer can advance a stale hint. A producer paused after publication holds no required private state.
-4. **FIFO:** producers cannot proceed to `p + 1` until `p` has been published. The consumer advances in position order.
-5. **Safe reuse:** the consumer copies the value before storing the next empty generation.
-6. **Full detection:** an older generation at `p` means the slot from the preceding lap has not been reclaimed. With a sole FIFO consumer, that establishes a full ring during the attempt.
-
-Successful push linearizes at the slot CAS; successful pop at the empty-record store. Concurrent producer invocations are ordered by successful publication, not by thread ID or wall-clock invocation order.
-
-CAS failures and failed helper attempts imply competing state advancement. Suspending a producer before or after publication does not prevent the others from continuing. A suspended sole consumer can cause the queue to fill; returning full then is the correct capacity behavior.
-
-## 8. SPMC design
-
-### State and ownership
-
-```text
-atomic<uint64_t> slots[N]
-uint64_t producer_pos = 0       // private to the only producer
-atomic<uint64_t> head_hint = 0  // consumers advance/help this cursor
-```
-
-### Producer algorithm
-
-```text
-p = producer_pos
-if p == L:
-    return exhausted
-
-record = slots[p & mask].load()
-if sequence(record) != 2*p:
-    return full
-
-slots[p & mask].store(READY(p, value))
-producer_pos = p + 1
-return success
-```
-
-The producer needs no CAS because it is the only writer allowed to publish into an empty slot of that generation.
-
-### Consumer algorithm
-
-```text
-loop:
-    p = head_hint.load()
-    record = slots[p & mask].load()
-    s = sequence(record)
-
-    if s < 2*p + 1:
-        return empty
-
-    if s > 2*p + 1:
-        head_hint.CAS(p, p + 1)    // another consumer already consumed p
-        continue
-
-    value = payload(record)       // private copy from the atomic load
-    if slots[p & mask].CAS(record, EMPTY(p + N)):
-        head_hint.CAS(p, p + 1)    // one attempt; helper may already have done it
-        out = value
-        return success
-
-    // Discard the private copy and retry; another consumer won
-```
-
-### Why this works
-
-1. **Exclusive consumption:** only one consumer can CAS a particular ready generation to the next empty generation.
-2. **No unsafe payload race:** all contenders obtain the payload through an atomic record load. Losing consumers discard their local copies.
-3. **Immediate reclamation:** the winning CAS both consumes the item and frees the slot. The producer may reuse it even if the winning consumer is suspended before returning.
-4. **Helping:** a later sequence proves position `p` was consumed. Another consumer advances the stale head hint.
-5. **FIFO:** head advancement follows successful consumption of the previous position. Successful pops are ordered by slot CAS.
-6. **No dependence on a losing reader:** a consumer suspended before CAS cannot prevent another consumer from winning or the producer from eventually reusing the slot. Its old CAS fails against the new generation.
-
-Successful push linearizes at the ready-record store; successful pop at the empty-record CAS. Different consumers may **return or finish processing** in a different order from dequeue linearization. FIFO queue removal does not enforce FIFO job completion.
-
-## 9. Why the usual non-atomic payload variants are not selected
-
-These alternatives are useful to explain during the interview, but do not meet this document's strict progress target without more machinery.
-
-### MPSC: reserve, write, publish
-
-```text
-P0 reserves position k and is suspended before publishing.
-P1 publishes k + 1 and returns successfully.
-C reaches k and cannot read its unfinished payload.
-```
-
-Waiting for P0 creates a progress dependency. Reporting ordinary empty after P1 has completed can violate a strict FIFO queue specification. Reporting a distinct `not_ready` result is possible, but changes the API and does not remove the publication hole.
-
-### SPMC: claim, copy, release
-
-```text
-C0 claims position k and is suspended before copying its ordinary payload.
-Other consumers proceed.
-P eventually wraps to k's physical slot.
-```
-
-The producer cannot overwrite that slot while C0 may still read it. A later slot being free does not make this slot safe. Similarly, reading an ordinary payload before winning a head CAS is unsafe: another consumer can win and allow concurrent reuse.
-
-Increasing memory ordering to `seq_cst` does not solve either ownership problem. The selected compact-record algorithms remove the vulnerable interval by making the relevant payload/state transition atomic.
-
-## 10. Validation plan
-
-Passing a stress test does not prove lock-freedom or correctness under all C++ executions. Use tests to challenge the invariants and retain a written argument for each shared access.
-
-### Functional and accounting tests
-
-- Empty queue; one item; exactly `N` accepted items; next push rejected.
-- Verify rejected pushes do not modify existing items and failed pops preserve `out`.
-- Repeated physical wrap with capacities 2, 4, 8, and larger sizes.
-- Payload edge cases: zero and all bits set.
-- After workers stop and the queue drains: accepted count equals popped count.
-- Unique IDs: no missing accepted IDs, duplicate IDs, or fabricated IDs.
-- FIFO for sequential operations and per-producer order for MPSC.
-- For SPMC, check removal order with controlled instrumentation, not the order consumer threads append to a results vector.
-
-### Adversarial schedules
-
-Add test-only pause hooks around shared transitions:
-
-| Pause point | Required observation |
+| Transfer | Required relationship |
 | --- | --- |
-| MPSC before publication CAS | Other producers can publish; paused producer owns no slot |
-| MPSC after publication, before tail help | Consumer can pop; other producers help and continue |
-| SPMC after record load, before consumption CAS | Other consumer wins; stale CAS fails after reuse |
-| SPMC after consumption CAS, before head help | Other consumers help; producer can reuse the freed slot |
-| SPSC before release publication | Consumer cannot read the unfinished value |
-| SPSC before release reclamation | Producer cannot reuse the slot |
+| Copy message, then publish ready index | Publication releases the completed write |
+| Obtain ready index, then copy message | Dequeue acquires publication |
+| Finish reading, then return free index | Return releases completion of the read |
+| Obtain free index, then overwrite | Dequeue acquires reclamation |
 
-Use reduced-width sequence fields in a test configuration to reach exhaustion quickly. Confirm rejection at the boundary, successful draining, and reinitialization only after every old operation has finished. Separately test SPSC unsigned cursor wrap.
+```text
+message write
+  -> ready-index release publication
+  -> acquiring ready-index dequeue
+  -> message read
+  -> free-index release publication
+  -> acquiring free-index dequeue
+  -> next message write
+```
 
-Record small concurrent invocation/response histories and check for a legal FIFO sequential ordering that respects real-time precedence. Do not infer cross-thread enqueue order from timestamps taken before the actual publication.
+The slot publication CAS and observing entry load establish the payload synchronization. Preserve ordering on NCQ cursor/helping operations too; they are not SPSC private cursors.
 
-### Tooling and review
+Sequentially consistent operations include the acquire/release properties needed here. No separate fences, atomic message fields, or volatile are needed. Order reductions require an argument for both ownership transfers and the index protocol. [C++ memory ordering](https://eel.is/c++draft/atomics.order)
 
-- Use a race detector on a supported compiler/platform; add a Linux/Clang validation build if the Windows toolchain lacks the required support.
-- Use address and undefined-behavior sanitizers where supported.
-- Exercise a weakly ordered architecture when available, especially for SPSC acquire/release.
-- Model small capacities and pause schedules; review the compact-record algorithm independently before weakening atomics.
-- Check lock-free atomic support in each target build.
+### Counter lifetime and ABA
 
-## 11. Benchmark plan
+Use 64-bit positions and the source's cycle representation. An entry stores an index, not a full message, so the low log2(N) bits encode that index and the remaining bits encode a cycle. The cycle advances once per N positions. For N = 1024, 54 cycle bits and 10 index bits represent 2^64 logical positions before repetition. This eliminates the short 32-bit-sequence lifetime, but fixed-width generations still do not provide an unlimited ABA guarantee.
 
-Measure release builds after correctness validation:
+The initial correctness scope assumes no full uint64_t counter wrap during the object's operational lifetime. Set a supported budget below 2^63 head/tail advances per internal ring, including initialization offsets. This is a lifetime precondition, not an `exhausted` hot-path result. Drain, join all participants, and reconstruct well before that bound; never reset a live queue.
 
-| Dimension | Cases |
+Physical array wrap is supported and frequent. Full counter wrap across an arbitrarily suspended CAS observer is a separate problem. Reduced-width tests exercise stale generations and the lifecycle boundary without claiming arbitrary-wrap correctness.
+
+## 8. MPSC behavior
+
+| Internal ring | Enqueue callers | Dequeue callers |
+| --- | --- | --- |
+| ready_indices | Message producers | Sole consumer |
+| free_indices | Sole consumer | Message producers |
+
+A producer paused during copying owns a block but has not entered the ready FIFO. Another producer may publish first:
+
+```text
+P0 acquires block 7 and pauses mid-copy.
+P1 acquires block 3, finishes B, and publishes index 3.
+C receives B without waiting for P0.
+P0 later finishes A and publishes index 7.
+```
+
+Overlapping pushes may be ordered this way. FIFO follows ready-index publication, not free-block allocation or invocation time. Sequential pushes from one producer preserve its order. A completed push precedes another push that begins afterward.
+
+Push linearizes at ready-index publication; pop at the successful ready-ring head CAS. Returning a block affects resource availability, not removal order.
+
+A producer paused after publication but before tail advancement can be helped by another producer. The consumer can see the entry before its publisher returns. The publisher must never touch message bytes after publication, even while finishing metadata bookkeeping.
+
+## 9. SPMC behavior
+
+| Internal ring | Enqueue callers | Dequeue callers |
+| --- | --- | --- |
+| ready_indices | Sole producer | Message consumers |
+| free_indices | Message consumers | Sole producer |
+
+A consumer first wins an index dequeue and then copies its block. A consumer paused during copying keeps its block out of free_indices:
+
+```text
+C0 claims index 7 and pauses during its copy.
+C1 claims index 3, finishes, and returns index 3.
+P can reuse block 3 for another message.
+P cannot reuse block 7 until C0 returns it.
+```
+
+The message array is not reused in a forced physical order. Other blocks can circulate around a suspended consumer.
+
+Several consumers may inspect an atomic index entry, but only the head-CAS winner reads its message. A losing consumer discards its stale candidate without dereferencing it.
+
+Pushes follow the sole producer's order. Pops linearize at ready-ring head CAS operations. Consumer return order and processing completion order can differ from FIFO removal order. No fairness or broadcast guarantee is made.
+
+## 10. Correctness and progress obligations
+
+The key safety invariants are:
+
+1. Every block index has exactly one abstract owner.
+2. Only the owner accesses ordinary message bytes.
+3. Ready publication follows the complete producer copy.
+4. Free publication follows the complete consumer copy.
+5. An index is published/returned once, never duplicated.
+6. Every internal enqueue satisfies its capacity precondition.
+
+Together with the index FIFO, these establish no torn messages, no premature reuse, exactly-once successful removal, and FIFO publication/removal.
+
+Lock-free means system-wide operation completion; an individual loop may starve. Wait-free means bounded own-step completion. Absence of mutexes establishes neither.
+
+NCQ's competing CAS failures demonstrate another operation's advancement; helpers complete a published tail transition. The wrapper composes two index operations and a finite copy while preserving the enqueue precondition.
+
+A suspended participant can retain one block. Others use the remaining pool instead of waiting for that specific block. With N >= K and one call per participant, K - 1 suspended participants cannot privately retain every block. Ready messages can occupy the remainder, legitimately causing capacity rejection. A stopped sole producer or consumer naturally leads the opposite side toward empty or no-capacity results.
+
+This does not guarantee unchanged effective capacity, successful push on every call, individual fairness, or hard real-time latency. Finite copies and lock-free metadata primitives are algorithmic assumptions; scheduling and page faults are outside that guarantee.
+
+**Validate against the resource-capacity contract.** Do not claim linearizability against a different specification that permits rejection only when N published messages exist.
+
+## 11. Alternatives not selected
+
+| Alternative | Reason |
 | --- | --- |
-| Topology | 1P/1C, 2P/1C, 4P/1C, 1P/2C, 1P/4C |
-| Capacity | 64, 1,024, 65,536 |
-| Traffic | Balanced, producer faster, consumer faster, bursts |
-| Placement | Same core complex, separate cores, cross-NUMA if available |
-| Baseline | Equivalent fixed-capacity queue protected by a mutex |
+| Atomic message plus generation | Arbitrary-size messages cannot rely on portable lock-free whole-message atomics |
+| Direct reserve/write/publish ring | A paused producer can leave a FIFO publication hole |
+| Direct claim/copy/release ring | A paused reader can prevent reuse of a required physical slot |
+| Per-producer SPSC queues | Changes global FIFO and partitions capacity |
+| SCQ index engine | Possible later optimization; more protocol complexity initially |
 
-Report successful transfers per second, failed attempts/drop rate, and operation latency distributions including tail latency. Separate attempted pushes from accepted items. Distinguish time spent inside a call from enqueue-to-dequeue residence time.
+Vyukov's bounded sequence-slot queue explicitly disclaims formal lock-freedom. It is useful to study, but should not be relabeled to meet this requirement. [Author's description](https://sites.google.com/site/1024cores/home/lock-free-algorithms/queues/bounded-mpmc-queue)
 
-Use thread-local counters, warm-up, repeated runs, and recorded CPU/compiler details. Keep timing and logging overhead out of the primary throughput loop. Do not claim that lock-free must outperform a mutex, or that throughput demonstrates a progress guarantee.
+## 12. Validation plan
 
-Run below the compact generation budget or reset between fully quiescent benchmark runs. Never silently reset counters to extend a run.
+### Functional tests
 
-## 12. Implementation milestones
+- Test 4-byte, 64-byte, 500-byte, and 4-KiB messages.
+- Include embedded arrays, over-aligned types, and a trivially copyable type without a default constructor.
+- Check empty, one item, N sequential pushes, rejection, and complete drain.
+- Failed push preserves input; failed pop preserves output.
+- After quiescence and drain, accepted count equals popped count and every block index is free exactly once.
+- Use unique IDs, producer IDs, lengths, and checksums to detect duplicates, loss, torn copies, and premature reuse.
+- Compare initialized fields or explicitly filled arrays, not arbitrary struct padding.
+- Exercise repeated physical wraps. Multi-party tests obey N >= K; N = 4 supports minimal 2P/1C and 1P/2C cases.
 
-1. Implement SPSC with the shared value API, acquire/release ownership transfers, and boundary tests.
-2. Implement/test packing, generation comparisons, exhaustion, and target atomic requirements.
-3. Implement MPSC with atomic publication and producer helping; validate forced pauses.
-4. Implement SPMC with atomic consumption/reclamation and consumer helping; validate stale readers.
-5. Check small concurrent histories, run sanitizers, and review invariants against the actual code.
-6. Benchmark against a mutex baseline; optimize one measured bottleneck at a time.
-7. If long-running service use or larger payloads is needed, complete a separate wrap-safe/wider-payload design before claiming production suitability.
+### Forced schedules
 
-Completion means the implemented API matches these contracts, ordering choices have an explanation, pause tests confirm the intended helping behavior, and limitations are visible in the README. A useful interview discussion should explain both why a slot is safe to access and why a paused participant cannot strand a required transition.
+| Pause location | Required observation |
+| --- | --- |
+| Producer owns block, before/during copy | Other producer can publish another block |
+| Ready publication, before tail help | Helpers and consumer continue; message is complete |
+| Consumer sees index, before head CAS | Winner proceeds; loser never reads message bytes |
+| Consumer owns block, during copy | Other blocks circulate; owned block is never reused |
+| Consumer finishes copy, before free publication | Block remains unavailable until returned |
+| Free publication, before tail help | Returning consumers can help; allocator can obtain the published index |
+
+Instrument ownership states in tests without adding production synchronization. Include a schedule exhausting free storage with ready and in-flight messages and verify no_capacity without asserting that the ready queue is full.
+
+Check small concurrent histories against the declared resource-bounded contract. Check FIFO at publication/removal, not by post-return result-vector append order. Model NCQ separately with small capacities and stale observations.
+
+Use race, address, and undefined-behavior sanitizers on supported builds; add a Linux/Clang validation build if needed. Exercise a weakly ordered architecture when available. Tests support the proof review; passing stress tests alone does not establish correctness or lock-freedom.
+
+## 13. Benchmarks and implementation sequence
+
+Benchmark release builds with balanced traffic, bursts, and overload on either endpoint. Use 1P/1C, 2P/1C, 4P/1C, 1P/2C, and 1P/4C; capacities 64, 1,024, and 65,536; and the message sizes above.
+
+Report successful transfers, rejected pushes, latency distributions, and CPU/compiler details. Separate copying cost from metadata cost. Compare an equivalent fixed-storage mutex queue. Keep logging and shared measurement counters out of the hot path; lock-free does not imply faster.
+
+Implementation order:
+
+1. **SPSC:** implement the generic byte-storage queue; validate boundaries, FIFO, and acquire/release ownership transfers.
+2. **NCQ:** pin the reference revision and port the complete MPMC index engine with seq_cst atomics and identity mapping. Test initialization, cycling, competing enqueues/dequeues, helping, and the private enqueue capacity precondition. Test indices independently before adding message copies.
+3. **SPMC:** implement the internal message pool and shared wrapper, then expose the SPMC class. Validate competing consumers, large copies, index reclamation, and consumers paused during copying.
+4. **MPSC:** reuse the validated pool/engine for the MPSC class. Validate competing producers and publication ordering when a producer pauses during copying.
+5. **Integration:** run 500-byte message checks, conservation/FIFO tests, forced schedules, and separate TSan and ASan/UBSan builds. A supported Linux/Clang build can provide TSan coverage when developing on Windows.
+6. **Benchmarks:** compare with a fixed-storage mutex queue; consider weaker orders or cache remapping only after correctness review and measurement.
+
+Large-message support is part of the initial deliverable. Callers do not supply an allocator or handle-lifetime protocol. The public push results are success and no_capacity; there is no exhausted result. The counter-lifetime assumption in section 7 still applies.
+
+## 14. References
+
+1. **Ruslan Nikolaev. A Scalable, Portable, and Memory-Efficient Lock-Free FIFO Queue. DISC 2019.** [Published paper](https://doi.org/10.4230/LIPIcs.DISC.2019.28), [readable full text](https://arxiv.org/html/1908.04511). Read section 3 for the two-index-queue design and assumptions, section 4 for NCQ, section 6 for its lock-free argument, and section 7 for concurrent evaluation. The paper's main contribution is SCQ; this project initially implements its simpler NCQ baseline.
+2. **Author's reference code:** [lfqueue repository](https://github.com/rusnikola/lfqueue), [NCQ: lfring_naive.h](https://github.com/rusnikola/lfqueue/blob/master/lfring_naive.h). Pin a commit when porting and retain the applicable license notices.
+3. **C++ specification:** [memory ordering](https://eel.is/c++draft/atomics.order), [atomic lock-free properties](https://eel.is/c++draft/atomics.lockfree), [trivially copyable objects](https://eel.is/c++draft/basic.types.trivial).
+4. **Validation tools:** [ThreadSanitizer](https://clang.llvm.org/docs/ThreadSanitizer.html), [AddressSanitizer](https://clang.llvm.org/docs/AddressSanitizer.html), [UndefinedBehaviorSanitizer](https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html).
