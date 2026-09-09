@@ -1,6 +1,6 @@
 # Fixed-capacity concurrent message queues in C++
 
-Status: design proposal; implementation and validation remain. Build **SPSC -> NCQ -> SPMC -> MPSC**.
+Status: SPSC, NCQ, SPMC, and MPSC are implemented as header-only classes under [include/lfq](include/lfq). Tests are in [spsc_ring_tests.cpp](tests/spsc_ring_tests.cpp) and [concurrent_ring_tests.cpp](tests/concurrent_ring_tests.cpp). See [README.md](README.md) for build commands and validation limits. Learning order: **SPSC -> NCQ -> SPMC -> MPSC**.
 
 ## 1. Scope and supported messages
 
@@ -112,9 +112,9 @@ For SPSC, an acquire load may conservatively observe an older opposite cursor an
 
 - Require a complete, non-cv, trivially copyable object type T. Wrap raw arrays in a struct or `std::array` for the public type.
 - Arguments are live complete T objects; out is writable. Callers must not access those objects concurrently in a conflicting way.
-- Copy representations with `std::memcpy` and `std::addressof`; do not invoke custom assignment operations.
-- Internal blocks are byte arrays of sizeof(T). The queue does not require T's default constructor or copy-assignment operator.
-- Never cast internal bytes to T*. Copy the saved representation into the caller's existing T object.
+- Copy representations with `std::memcpy` and ordinary `&` addresses; T must not overload unary operator&.
+- Internal blocks are `std::array<T, Capacity>`. T must be default-constructible; all slots are constructed with the queue, before concurrent access.
+- Copies use existing live T objects and do not require a copy-assignment operator. Push/pop do not construct new objects.
 - Pointer members are copied as pointers. Pointee lifetime remains the application's responsibility.
 
 Byte copying for trivially copyable objects is supported by the [C++ object-representation rules](https://eel.is/c++draft/basic.types.trivial).
@@ -127,11 +127,11 @@ Initialize before publishing the queue to threads. Reset, destruction, and threa
 N = Capacity, a power of two
 
 SPSC:
-    byte_blocks[N][sizeof(T)]
+    T blocks[N]
     atomic<uint64_t> read, write
 
 MPSC/SPMC:
-    byte_blocks[N][sizeof(T)]
+    T blocks[N]
     NcqIndexRing<N> free_indices
     NcqIndexRing<N> ready_indices
 
@@ -501,7 +501,7 @@ Vyukov's bounded sequence-slot queue explicitly disclaims formal lock-freedom. I
 ### Functional tests
 
 - Test 4-byte, 64-byte, 500-byte, and 4-KiB messages.
-- Include embedded arrays, over-aligned types, and a trivially copyable type without a default constructor.
+- Include embedded arrays, over-aligned types, and default-constructible trivially copyable types with deleted copy assignment.
 - Check empty, one item, N sequential pushes, rejection, and complete drain.
 - Failed push preserves input; failed pop preserves output.
 - After quiescence and drain, accepted count equals popped count and every block index is free exactly once.
@@ -534,7 +534,7 @@ Report successful transfers, rejected pushes, latency distributions, and CPU/com
 
 Implementation order:
 
-1. **SPSC:** implement the generic byte-storage queue; validate boundaries, FIFO, and acquire/release ownership transfers.
+1. **SPSC:** implement the generic typed-storage queue; validate boundaries, FIFO, and acquire/release ownership transfers.
 2. **NCQ:** pin the reference revision and port the complete MPMC index engine with seq_cst atomics and identity mapping. Test initialization, cycling, competing enqueues/dequeues, helping, and the private enqueue capacity precondition. Test indices independently before adding message copies.
 3. **SPMC:** implement the internal message pool and shared wrapper, then expose the SPMC class. Validate competing consumers, large copies, index reclamation, and consumers paused during copying.
 4. **MPSC:** reuse the validated pool/engine for the MPSC class. Validate competing producers and publication ordering when a producer pauses during copying.
